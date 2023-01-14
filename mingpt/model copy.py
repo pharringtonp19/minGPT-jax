@@ -11,14 +11,15 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import jax 
 import jax.numpy as jnp 
 import flax.linen as nn 
-
-
-
-
-
 from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
+
+class ModuleDict(nn.Module): 
+    dict_: dict 
+
+    def __getattr__(self, name: str) -> Any:
+        return self.dict_[name]
 
 class NewGELU(nn.Module):
     """
@@ -84,15 +85,16 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm()
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm()
-        self.c_fc    = nn.Dense(4 * config.n_embd)
-        self.c_proj  = nn.Dense(config.n_embd)
-        self.act     = NewGELU()
-        self.dropout = nn.Dropout(config.resid_pdrop)
-        m = self 
+        self.mlp = ModuleDict(dict(
+            c_fc    = nn.Dense(4 * config.n_embd),
+            c_proj  = nn.Dense(config.n_embd),
+            act     = NewGELU(),
+            dropout = nn.Dropout(config.resid_pdrop)))
+        m = self.mlp
         mlpf = lambda x, train: m.dropout(m.c_proj(m.act(m.c_fc(x))), deterministic=train) # MLP forward
 
 
-    def forward(self, x, train: bool):
+    def __call__(self, x, train: bool):
 
         x = x + self.attn(self.ln_1(x), train=train)
         x = x + self.mlpf(self.ln_2(x), train=train)
@@ -119,8 +121,8 @@ class GPT(nn.Module):
         C.attn_pdrop = 0.1
         return C
 
-    def __init__(self, config):
-        super().__init__()
+    def setup(self):
+        config = self.config 
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
@@ -148,14 +150,14 @@ class GPT(nn.Module):
                 'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
             }[config.model_type])
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+        self.transformer = ModuleDict(dict(
+            wte = nn.Embed(config.vocab_size, config.n_embd),
+            wpe = nn.Embed(config.block_size, config.n_embd),
             drop = nn.Dropout(config.embd_pdrop),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            h = [Block(config) for _ in range(config.n_layer)],
+            ln_f = nn.LayerNorm(),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Dense(config.vocab_size, use_bias=False)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -264,19 +266,19 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, idx, targets, train):
+        b, t = idx.shape
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        pos = jnp.arange(0, t, dtype=jnp.float32)[None] # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb + pos_emb, deterministic=not train)
+        block : Block
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x, train)
+        x = self.transformer.ln_f(x) #layer norm
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
