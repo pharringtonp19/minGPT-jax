@@ -4,7 +4,7 @@ import sys
 import json
 import random
 from ast import literal_eval
-
+import typing 
 import numpy as np
 import torch
 
@@ -101,3 +101,11 @@ class CfgNode:
             # overwrite the attribute
             print("command line overwriting config attribute %s with %s" % (key, val))
             setattr(obj, leaf_key, val)
+    
+    if typing.TYPE_CHECKING:
+        
+        def __getattr__(self, name):
+            raise NotImplementedError()
+        
+        def __setattr__(self, name, value): 
+            raise NotImplementedError()
